@@ -1,0 +1,245 @@
+# English -> Telugu translation pipeline configuration
+#
+# =============================================================================
+# WHICH MODEL DOES WHAT
+# =============================================================================
+# Every call in this pipeline goes to Gemini. Three roles, and they are
+# deliberately NOT all the same model:
+#
+#   TRANSLATION -- Tier 1 ....... gemini-3.5-flash-lite   Batch Mode
+#       The whole-corpus English -> Telugu pass. All 158,490 sentences go
+#       through here exactly once. Cheapest stage of the run: ~$14 of ~$90.
+#       Produces `telugu_sentence`.
+#
+#   TRANSLATION -- Tier 2 ....... gemini-3.7-flash        synchronous
+#       Escalation only, for the ~11% of sentences Tier 1 gets wrong. MUST be
+#       a stronger model than Tier 1: re-asking flash-lite the same question
+#       at temperature 0 just returns the same failing answer, so escalation
+#       only buys something if the model actually changes. ~$7 of the run.
+#
+#   TRANSLITERATION ............. gemini-3.7-flash        (rides on the judge)
+#       The Roman-script rendering of each Telugu sentence, exported as
+#       `telugu_romanized`. The judge returns it in the SAME response as its
+#       scores, so it costs no extra API call, no extra quota and no extra
+#       request -- only its own output tokens. It is a deliverable, not a
+#       quality signal: if the judge omits it the sentence is still accepted
+#       on its scores and the omission is logged. It never causes a rejection.
+#
+#   JUDGING ..................... gemini-3.7-flash        Batch Mode, thinking LOW
+#       Scores 7 quality dimensions per translation. Deliberately NOT the
+#       Tier-1 model -- a model grading its own output is not an independent
+#       gate, and this is the only thing standing between a bad translation
+#       and the exported corpus. By far the largest stage: ~$69 of the ~$90
+#       run and ~69% of all tokens. Scoring the corpus costs more than twice
+#       what producing it does.
+#
+# The accept/reject decision is made by NO model. pipeline/validation.py
+# recomputes it locally from the judge's per-dimension scores plus a local
+# cross-lingual embedding score the judge cannot influence.
+#
+# Total: ~86.4M tokens, ~$89.87 (about Rs 7,900), measured per-sentence from
+# live API calls against a 384-sentence stratified sample on 2026-09-09.
+# =============================================================================
+
+translation:
+  # Tier 1: the whole-corpus translation pass. Rs 1,237 for all 158,490
+  # sentences on Batch Mode.
+  #
+  # NOTE: whether Gemini's Telugu matches a dedicated Indic MT engine's was
+  # never conclusively settled -- a 25-sentence pilot and a 384-sentence
+  # stratified run disagreed, and the controlled head-to-head was cut short.
+  # If translation quality disappoints in production, that is the first thing
+  # to re-examine.
+  tier1:
+    # `provider` is not a switch -- it is recorded against every exported
+    # sentence as provenance (translation_provider), so the corpus says what
+    # produced it.
+    provider: gemini
+    model: gemini-3.5-flash-lite
+    temperature: 0.0
+    max_output_tokens: 8192
+    # Sentences per batch request. 25 measured at 89.55 input tokens/sentence;
+    # larger chunks amortize the system prompt further but put more sentences
+    # at risk if one response comes back malformed.
+    chunk_size: 25
+    # Requests per batch job, and jobs in flight at once. Batch jobs carry a
+    # fixed overhead of roughly 60-90s each regardless of size (measured: a
+    # 1-request job took 1m34s, a 2-request job 2m39s), so packing more requests
+    # per job is what keeps the run short.
+    #
+    # Concurrency is bounded by the ~3M enqueued-token quota across ACTIVE jobs,
+    # not by the 100-concurrent-job limit. At 25 sentences x 89.55 input tokens
+    # x 50 chunks = ~112k input tokens per job, the cap allows ~26 jobs; 12
+    # leaves real headroom. Recompute this if chunk_size or batch_job_max_chunks
+    # changes.
+    batch_job_max_chunks: 50
+    max_concurrent_jobs: 12
+    # Digits are kept as ASCII numerals, which is what the entity-preservation
+    # rule in pipeline/validation.py checks for. If you ever prompt for Telugu
+    # numerals instead, that check has to change with it.
+    source_language_code: en-IN
+    target_language_code: te-IN
+
+  # Tier 2: escalation only, for sentences that failed QC after Tier 1.
+  #
+  # This MUST be a different, stronger model than Tier 1. Re-asking one model
+  # the same question at temperature 0 returns the same failing answer, so
+  # escalation only buys something if the model actually changes.
+  tier2:
+    provider: gemini
+    model: gemini-3.7-flash
+    temperature: 0.0
+    max_output_tokens: 8192
+    # Sentences per escalation request. Previously this silently borrowed the
+    # judge's chunk_size, which coupled two unrelated stages.
+    chunk_size: 25
+
+judge:
+  provider: gemini
+  # Deliberately NOT the Tier-1 model. A model grading its own output has no
+  # independence, and the judge is the only gate standing between a bad
+  # translation and the exported corpus.
+  model: gemini-3.7-flash
+  temperature: 0.0
+  max_output_tokens: 32768
+  # Gemini 3.x replaced the integer thinking_budget with a LOW/MEDIUM/HIGH enum
+  # and defaults to MEDIUM. Measured across 384 sentences: LOW emits exactly
+  # zero thinking tokens, leaves output length essentially unchanged (176.5 vs
+  # 277.3 tokens per judgement) and still agrees with MEDIUM on 96.1% of
+  # verdicts -- with the disagreements falling in the STRICT direction, which is
+  # the safe way to be wrong. Thinking tokens bill at the output rate, so this
+  # is ~40% of the judge bill for no measured gain.
+  #
+  # gemini-3.5-flash-lite would be cheaper still, but it was measured LENIENT
+  # (passing 356/384 where this judge passes 342) -- it buys its savings by
+  # lowering the bar, which is not a trade worth making on the quality gate.
+  thinking_level: LOW
+  # Judge work is submitted as Gemini batch jobs (roughly half the synchronous
+  # price), split into sub-jobs of at most this many chunks and run
+  # max_concurrent_jobs at a time.
+  #
+  # These were 14 and 2, inherited from the sentence-generation pipeline, and
+  # were dead config: at the old batch_size of 200 a work unit produced only 10
+  # chunks, so the queue was never longer than one job and concurrency never
+  # exceeded 1 no matter what this said. Raising pipeline.batch_size is what
+  # makes them live.
+  #
+  # Same enqueued-token math as Tier 1 above: 20 sentences x 162.28 input tokens
+  # x 50 chunks = ~162k input tokens per job, so the ~3M cap across active jobs
+  # allows ~18. 12 leaves headroom.
+  batch_job_max_chunks: 50
+  max_concurrent_jobs: 12
+  # Sentences per judge request. Each carries an English source plus its Telugu
+  # translation, so chunks run larger than a plain text batch.
+  chunk_size: 20
+
+embedding:
+  provider: local
+  # Cross-lingual model: the English source and the Telugu translation must
+  # land in the SAME vector space for their cosine similarity to mean anything.
+  # (all-MiniLM-L6-v2, used by the sentence-generation pipeline, is
+  # English-only and would score every EN->TE pair as unrelated.)
+  model: intfloat/multilingual-e5-base
+  # e5 models are trained with these prefixes and degrade noticeably without
+  # them.
+  query_prefix: "query: "
+  passage_prefix: "passage: "
+
+pipeline:
+  # Sentences per orchestrator work unit. The orchestrator translates a whole
+  # work unit, then BLOCKS on judging it before translating the next one, so
+  # this number sets how many times the run pays that serialization penalty:
+  # 158,490 sentences at the old 200 meant 793 sequential translate-then-judge
+  # round trips, each waiting out a full batch job. At 20,000 it is 8.
+  #
+  # Bigger is better here up to memory, and resume is unaffected -- state is
+  # checkpointed per batch job completion, not per work unit.
+  batch_size: 20000
+  max_attempts_per_sentence: 2   # 1 Tier-1 attempt, then 1 Tier-2 escalation
+
+# Deterministic, local rule checks run on every translation BEFORE it costs a
+# judge call. A failure here escalates straight to Tier 2.
+rules:
+  # These next two work as a pair, and the split matters:
+  #
+  # min_telugu_letter_ratio is the "is this even Telugu" check. Romanized
+  # Telugu and wholly untranslated English both score 0.00, so anything above
+  # zero catches them. It is set at 0.50 (Latin letters may not outnumber
+  # Telugu ones) rather than higher because the translation prompt REQUIRES
+  # preserving brand names and technical terms -- a correct translation
+  # carrying one preserved entity legitimately lands around 0.6, and a
+  # stricter bar rejected exactly the entity preservation we asked for.
+  #
+  # max_latin_run_chars does the leakage detection instead: a preserved proper
+  # noun is short, while an untranslated English clause is long once spaces are
+  # stripped. That is the check that catches partial translation.
+  min_telugu_letter_ratio: 0.50
+  max_latin_run_chars: 25
+  # Telugu character count relative to the English source. Telugu needs more
+  # characters per word than English (conjuncts, longer inflections), so the
+  # upper bound is generous; the point is catching empty/truncated output at
+  # the low end and runaway repetition at the high end.
+  min_length_ratio: 0.50
+  max_length_ratio: 3.00
+  # Digit sequences in the English source must survive into the Telugu output
+  # (numerals_format is "international", so they should appear unchanged).
+  require_digit_preservation: true
+  # Cosine similarity at or above which two Telugu translations of the same
+  # word's sentences are treated as near-duplicates of each other.
+  near_duplicate_similarity_threshold: 0.95
+
+# Final QC gate. These are enforced deterministically in
+# pipeline/validation.py from the judge's per-dimension scores -- the judge's
+# own "decision" and "overall_score" fields are recorded for audit only and are
+# never trusted as the source of truth.
+judge_thresholds:
+  meaning_preservation: 0.90
+  completeness: 0.90
+  hallucination: 0.90
+  target_word_accuracy: 0.85
+  grammar: 0.85
+  naturalness: 0.85
+  context_preservation: 0.80
+
+# Cross-lingual cosine similarity floor.
+#
+# Calibrated against measured scores from this exact model, not guessed:
+#     correct translation .................. 0.89 - 0.92
+#     correct, different phrasing .......... 0.90
+#     wrong object (shoes -> books) ........ 0.87
+#     negation flipped (went -> didn't go) . 0.85
+#     completely unrelated sentence ........ 0.73 - 0.74
+#
+# Two things follow from that spread, and the second one matters a lot:
+#
+#  1. 0.80 sits in the gap between "unrelated" (~0.74) and "correct" (~0.89),
+#     with margin on both sides. An earlier value of 0.75 was nearly touching
+#     the unrelated floor and would have let garbage through.
+#
+#  2. This check CANNOT police meaning. A flipped negation still scores 0.85 --
+#     above any threshold that wouldn't also reject correct translations. So
+#     this is a gross-failure detector (wrong language, unrelated output,
+#     garbage) and nothing more. Meaning, completeness and hallucination are
+#     the judge's job, via judge_thresholds above. Do not raise this value
+#     hoping to catch semantic errors; it will only start rejecting good
+#     translations.
+semantic_similarity_threshold: 0.80
+
+paths:
+  input_file: input/english_sentences.jsonl
+  prompts_dir: prompts
+  data_raw: data/raw
+  data_processed: data/processed
+  data_rejected: data/rejected
+  data_final: data/final
+  logs_dir: logs
+  state_file: data/state.json
+
+retry:
+  max_api_attempts: 4
+  base_backoff_seconds: 2.0
+  max_backoff_seconds: 30.0
+
+logging:
+  level: INFO
+  file: pipeline.log
