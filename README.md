@@ -1,6 +1,6 @@
 # Anuvaad Forge
 
-An end-to-end factory for building an English→Telugu machine translation
+An end-to-end factory for building an English→Indic Languages machine translation
 training corpus: generate high-quality English sentences for a vocabulary list,
 then translate and quality-gate them into a parallel corpus.
 
@@ -18,11 +18,11 @@ prompts) and independently resumable.
               │  158,490 accepted English sentences
               ▼
   ┌─────────────────────────┐
-  │  sentence_translation/  │   translate to Telugu (native + romanized),
+  │  sentence_translation/  │   translate to Indic Languages (native + romanized),
   │                         │   rule-checked, LLM-judged, QC-gated
   └───────────┬─────────────┘
               ▼
-     English↔Telugu parallel corpus
+     English↔Indic Languages parallel corpus
 ```
 
 ## Phase 1 — `sentence_generation/`
@@ -42,7 +42,7 @@ Full write-up: `sentence_generation/PIPELINE_RECORD.txt`
 
 **Status: built and piloted; full 158,490-sentence run pending.**
 
-Translates Phase 1's output into Telugu with Gemini Flash-Lite (Batch Mode),
+Translates Phase 1's output into Indic Languages with Gemini Flash-Lite (Batch Mode),
 gates every translation through local deterministic rules (script, leakage,
 length, number preservation, near-duplicates), judges it with a different,
 stronger Gemini model across 7 dimensions, and independently verifies it with a
@@ -50,7 +50,7 @@ local cross-lingual embedding check. Sentences that fail escalate to that
 stronger model rather than re-asking the one that just failed.
 
 Output: `sentence_translation/data/final/final_translations.{jsonl,xlsx}` —
-each accepted sentence carries the Telugu in **both native script and
+each accepted sentence carries the Indic Languages in **both native script and
 romanized** form.
 
 Details: `sentence_translation/README.md`
